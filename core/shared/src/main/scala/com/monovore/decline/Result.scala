@@ -6,11 +6,21 @@ import cats.syntax.all._
 import cats.{Alternative, Applicative, Semigroup}
 
 private[decline] case class Result[+A](
-    get: Validated[Result.Failure, () => Validated[List[String], A]]
+    get: Validated[Result.Failure, () => Validated[List[String], A]],
+    warnings: List[String] = Nil
 ) {
 
   def mapValidated[B](fn: A => Validated[List[String], B]): Result[B] =
     Result(get.map { _.map { _.andThen(fn) } })
+
+  def withError(error: String): Result[A] =
+    Result(get.map { _.map {
+      case Invalid(errors) => Invalid(error +: errors)
+      case _ => Invalid(error +: Nil)
+    }})
+
+  def withWarning(warning: String): Result[A] =
+    Result(get, warning +: warnings)
 }
 
 private[decline] object Result {
@@ -68,6 +78,7 @@ private[decline] object Result {
     }
   }
 
+  def success[A](value: A, warnings: List[String]): Result[A] = Result(Validated.valid(() => Validated.valid(value)), warnings)
   def success[A](value: A): Result[A] = Result(Validated.valid(() => Validated.valid(value)))
 
   val fail = Result(Validated.invalid(Failure(Nil)))
@@ -91,11 +102,11 @@ private[decline] object Result {
         Result(applicative.ap(ff.get)(fa.get))
 
       override def combineK[A](x: Result[A], y: Result[A]): Result[A] = (x, y) match {
-        case (x0 @ Result(Valid(_)), _) => x0
-        case (_, y0 @ Result(Valid(_))) => y0
-        case (x0, y0 @ Result(Invalid(Failure(Nil)))) => x0
-        case (x0 @ Result(Invalid(Failure(Nil))), y0) => y0
-        case (Result(Invalid(Failure(xMissing))), Result(Invalid(Failure(yMissing)))) => {
+        case (x0 @ Result(Valid(_), _), _) => x0
+        case (_, y0 @ Result(Valid(_), _)) => y0
+        case (x0, y0 @ Result(Invalid(Failure(Nil)), _)) => x0
+        case (x0 @ Result(Invalid(Failure(Nil)), _), y0) => y0
+        case (Result(Invalid(Failure(xMissing)), _), Result(Invalid(Failure(yMissing)), _)) => {
           val merged = (xMissing zip yMissing).map { case (a, b) => a |+| b }
           Result(Invalid(Failure(merged)))
         }
