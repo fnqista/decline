@@ -45,7 +45,8 @@ private[decline] case class Parser[+A](command: Command[A])
           case Some(MatchAmbiguous) => failure(s"Ambiguous option/flag: --$option")
           case Some(MatchOption(next)) => consumeAll(rest, next(value))
           case Some(MatchOptArg(next)) => consumeAll(rest, next(Some(value)))
-          case None => Left(help.withErrors(s"Unexpected option: --$option" :: Nil))
+          case None =>
+            consumeAll(rest, Accumulator.ap(Accumulator.Pure(Result.missingDefinition(option)), accumulator))
         }
       }
       case LongOpt(option) :: rest =>

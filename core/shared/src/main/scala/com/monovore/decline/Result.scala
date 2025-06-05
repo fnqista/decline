@@ -1,7 +1,7 @@
 package com.monovore.decline
 
+import cats.data.Validated
 import cats.data.Validated.{Invalid, Valid}
-import cats.data.{Validated, ValidatedNel}
 import cats.syntax.all._
 import cats.{Alternative, Applicative, Semigroup}
 
@@ -19,46 +19,62 @@ private[decline] object Result {
       flags: List[Opts.Name] = Nil,
       commands: List[String] = Nil,
       argument: Boolean = false,
-      envVars: List[String] = Nil
-  ) {
-
-    def message: String = {
-      val flagString =
-        flags.distinct match {
-          case Nil => None
-          case one :: Nil => Some(s"flag $one")
-          case more => Some(more.mkString("flag (", " or ", ")"))
-        }
-
-      val commandString =
-        if (commands.isEmpty) None
-        else Some(commands.distinct.mkString("command (", " or ", ")"))
-
-      val argString = if (argument) Some("positional argument") else None
-
-      val envVarString =
-        if (envVars.isEmpty) None
-        else Some(envVars.distinct.mkString("environment variable (", " or ", ")"))
-
-      s"Missing expected ${List(flagString, commandString, argString, envVarString).flatten.mkString(", or ")}!"
-    }
-  }
+      envVars: List[String] = Nil,
+      definitions: List[String] = Nil
+  )
 
   object Missing {
 
-    implicit val semigroup: Semigroup[Missing] = new Semigroup[Missing] {
-      override def combine(x: Missing, y: Missing): Missing =
-        Missing(
-          x.flags ++ y.flags,
-          x.commands ++ y.commands,
-          x.argument || y.argument,
-          x.envVars ++ y.envVars
-        )
-    }
+    implicit val semigroup: Semigroup[Missing] = (x: Missing, y: Missing) =>
+      Missing(
+        x.flags ++ y.flags,
+        x.commands ++ y.commands,
+        x.argument || y.argument,
+        x.envVars ++ y.envVars,
+        x.definitions ++ y.definitions
+      )
   }
 
   case class Failure(reversedMissing: List[Missing]) {
-    def messages: Seq[String] = reversedMissing.reverse.map { _.message }
+    def messages: Seq[String] = {
+      reversedMissing.reverse
+        .map { missing =>
+          val flagString =
+            missing.flags.distinct match {
+              case Nil => None
+              case one :: Nil => Some(s"flag $one")
+              case more => Some(more.mkString("flag (", " or ", ")"))
+            }
+
+          val commandString =
+            if (missing.commands.isEmpty) None
+            else Some(missing.commands.distinct.mkString("command (", " or ", ")"))
+
+          val argString = if (missing.argument) Some("positional argument") else None
+
+          val envVarString =
+            if (missing.envVars.isEmpty) None
+            else Some(missing.envVars.distinct.mkString("environment variable (", " or ", ")"))
+          val missingElements = List(flagString, commandString, argString, envVarString).flatten
+          missingElements match {
+            case Nil => Option.empty[String]
+            case _ => Option(s"Missing expected ${missingElements.mkString(", or ")}")
+          }
+        }
+        .zip(reversedMissing.map { missing =>
+          missing.definitions.distinct match {
+            case Nil => None
+            case one :: Nil => Some(s"Unexpected option $one")
+            case more => Some(more.mkString("Unexpected option (", " or ", ")"))
+          }
+        })
+        .map {
+          case (Some(a), Some(b)) => s"$a${System.lineSeparator}$b"
+          case (Some(a), None) => a
+          case (None, Some(b)) => b
+          case _ => ""
+        }
+    }
   }
 
   object Failure {
@@ -78,6 +94,8 @@ private[decline] object Result {
   def missingArgument = Result(Validated.invalid(Failure(List(Missing(argument = true)))))
   def missingEnvVar(name: String) =
     Result(Validated.invalid(Failure(List(Missing(envVars = List(name))))))
+  def missingDefinition(option: String) =
+    Result(Validated.invalid(Failure(List(Missing(definitions = List(option))))))
 
   implicit val alternative: Alternative[Result] =
     new Alternative[Result] {
