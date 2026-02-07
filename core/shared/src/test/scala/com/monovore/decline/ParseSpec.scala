@@ -124,7 +124,7 @@ class ParseSpec extends AnyWordSpec with Matchers with Checkers {
         ),
         LsTestCase(
           args = List("--all", "--color", "always"),
-          expected = Invalid(List("Unexpected argument: always"))
+          expected = Invalid(List(Messages.unexpectedArgument("always")))
         ),
         LsTestCase(
           args = List("--color=always"),
@@ -240,7 +240,8 @@ class ParseSpec extends AnyWordSpec with Matchers with Checkers {
     "read a flag" in {
       val opts = Opts.flag("test", "...")
       opts.parse(List("--test")) should equal(Valid(()))
-      val Invalid(_) = opts.parse(List())
+      val Invalid(errors) = opts.parse(List())
+      errors should contain("Missing expected flag --test!")
     }
 
     "read a couple options" in {
@@ -251,11 +252,13 @@ class ParseSpec extends AnyWordSpec with Matchers with Checkers {
 
     "fail on misaligned options" in {
       val opts = (whatever, ghost).tupled
-      val Invalid(_) = opts.parse(List("--whatever", "--ghost", "dad"))
+      val Invalid(errors) = opts.parse(List("--whatever", "--ghost", "dad"))
+      errors should contain(Messages.unexpectedArgument("dad"))
     }
 
     "fail on unrecognized options, even with arguments" in {
-      val Invalid(_) = whatever.parse(List("--whatever=dude", "--unrecognized"))
+      val Invalid(errors) = whatever.parse(List("--whatever=dude", "--unrecognized"))
+      errors should contain(Messages.unexpectedOption("--unrecognized"))
     }
 
     "handle a single positional argument" in {
@@ -268,7 +271,8 @@ class ParseSpec extends AnyWordSpec with Matchers with Checkers {
     }
 
     "complain about option in argument position" in {
-      val Invalid(_) = (whatever, positional).tupled.parse(List("--whatever", "hello", "--ok"))
+      val Invalid(errors) = (whatever, positional).tupled.parse(List("--whatever", "hello", "--ok"))
+      errors should contain(Messages.unexpectedOption("--ok"))
     }
 
     "obey a --" in {
@@ -303,7 +307,8 @@ class ParseSpec extends AnyWordSpec with Matchers with Checkers {
 
       (first orElse second).parse(List("--first")) should equal(Valid(1))
       (first orElse second).parse(List("--second")) should equal(Valid(2))
-      val Invalid(_) = (first orElse second).parse(List("--third"))
+      val Invalid(errors) = (first orElse second).parse(List("--third"))
+      errors should contain(Messages.unexpectedOption("--third"))
     }
 
     "handle alternative arguments" in {
