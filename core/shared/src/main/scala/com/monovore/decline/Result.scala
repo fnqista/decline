@@ -1,16 +1,31 @@
 package com.monovore.decline
 
 import cats.data.Validated.{Invalid, Valid}
-import cats.data.{Validated, ValidatedNel}
+import cats.data.{Ior, Validated, ValidatedNel}
 import cats.syntax.all._
 import cats.{Alternative, Applicative, Semigroup}
 
+/** Represents an issue encountered during parsing */
+private[decline] sealed trait ParseIssue {
+  def message: String
+}
+private[decline] object ParseIssue {
+  /** Recoverable: unexpected option/arg that was skipped */
+  case class Warning(message: String) extends ParseIssue
+  /** Non-recoverable: parse error like ambiguous option, missing value */
+  case class Error(message: String) extends ParseIssue
+}
+
 private[decline] case class Result[+A](
-    get: Validated[Result.Failure, () => Validated[List[String], A]]
+    get: Validated[Result.Failure, () => Validated[List[String], A]],
+    issues: List[ParseIssue] = Nil
 ) {
 
   def mapValidated[B](fn: A => Validated[List[String], B]): Result[B] =
-    Result(get.map { _.map { _.andThen(fn) } })
+    Result(get.map { _.map { _.andThen(fn) } }, issues)
+
+  def withIssues(newIssues: List[ParseIssue]): Result[A] =
+    copy(issues = newIssues)
 }
 
 private[decline] object Result {
@@ -70,13 +85,13 @@ private[decline] object Result {
 
   def success[A](value: A): Result[A] = Result(Validated.valid(() => Validated.valid(value)))
 
-  val fail = Result(Validated.invalid(Failure(Nil)))
-  def missingFlag(flag: Opts.Name) =
+  val fail: Result[Nothing] = Result(Validated.invalid(Failure(Nil)))
+  def missingFlag(flag: Opts.Name): Result[Nothing] =
     Result(Validated.invalid(Failure(List(Missing(flags = List(flag))))))
-  def missingCommand(command: String) =
+  def missingCommand(command: String): Result[Nothing] =
     Result(Validated.invalid(Failure(List(Missing(commands = List(command))))))
-  def missingArgument = Result(Validated.invalid(Failure(List(Missing(argument = true)))))
-  def missingEnvVar(name: String) =
+  def missingArgument: Result[Nothing] = Result(Validated.invalid(Failure(List(Missing(argument = true)))))
+  def missingEnvVar(name: String): Result[Nothing] =
     Result(Validated.invalid(Failure(List(Missing(envVars = List(name))))))
 
   implicit val alternative: Alternative[Result] =
@@ -87,18 +102,17 @@ private[decline] object Result {
 
       override def pure[A](x: A): Result[A] = Result(applicative.pure(x))
 
-      override def ap[A, B](ff: Result[(A) => B])(fa: Result[A]): Result[B] =
-        Result(applicative.ap(ff.get)(fa.get))
+      override def ap[A, B](ff: Result[A => B])(fa: Result[A]): Result[B] =
+        Result(applicative.ap(ff.get)(fa.get), ff.issues ++ fa.issues)
 
       override def combineK[A](x: Result[A], y: Result[A]): Result[A] = (x, y) match {
-        case (x0 @ Result(Valid(_)), _) => x0
-        case (_, y0 @ Result(Valid(_))) => y0
-        case (x0, y0 @ Result(Invalid(Failure(Nil)))) => x0
-        case (x0 @ Result(Invalid(Failure(Nil))), y0) => y0
-        case (Result(Invalid(Failure(xMissing))), Result(Invalid(Failure(yMissing)))) => {
+        case (x0 @ Result(Valid(_), _), _) => x0
+        case (_, y0 @ Result(Valid(_), _)) => y0
+        case (x0, y0 @ Result(Invalid(Failure(Nil)), _)) => x0
+        case (x0 @ Result(Invalid(Failure(Nil)), _), y0) => y0
+        case (Result(Invalid(Failure(xMissing)), xIssues), Result(Invalid(Failure(yMissing)), yIssues)) =>
           val merged = (xMissing zip yMissing).map { case (a, b) => a |+| b }
-          Result(Invalid(Failure(merged)))
-        }
+          Result(Invalid(Failure(merged)), xIssues ++ yIssues)
       }
 
       override def empty[A]: Result[A] = fail

@@ -2,130 +2,209 @@ package com.monovore.decline
 
 import cats.Functor
 import cats.data.Validated.{Invalid, Valid}
-import cats.data.{NonEmptyList, Validated}
+import cats.data.{Ior, NonEmptyList, Validated}
 import cats.syntax.all._
 import com.monovore.decline.Opts.Name
 import com.monovore.decline.Parser.Accumulator.OrElse
+import com.monovore.decline.ParseIssue.{Error, Warning}
 
 import scala.annotation.tailrec
 import scala.util.{Left, Right}
 
+/** Parse mode for command-line parsing */
+sealed trait ParseMode
+object ParseMode {
+  /** Strict mode: unexpected options/args cause immediate failure */
+  case object Strict extends ParseMode
+  /** Lenient mode: unexpected options/args are accumulated as warnings */
+  case object Lenient extends ParseMode
+}
+
 private[decline] case class Parser[+A](command: Command[A])
-    extends ((List[String], Map[String, String]) => Either[Help, A]) {
+    extends ((List[String], Map[String, String], ParseMode) => Ior[Help, A]) {
 
   import Parser._
 
   def apply(args: List[String], env: Map[String, String]): Either[Help, A] =
-    consumeAll(args, Accumulator.fromOpts(command.options, env))
+    apply(args, env, ParseMode.Strict) match {
+      case cats.data.Ior.Left(h) => scala.util.Left[Help, A](h)
+      case cats.data.Ior.Right(a) => scala.util.Right[Help, A](a)
+      case cats.data.Ior.Both(h, _) => scala.util.Left[Help, A](h) // In strict mode, warnings are promoted to errors
+    }
+
+  def apply(args: List[String], env: Map[String, String], mode: ParseMode): Ior[Help, A] =
+    evalResult(consumeAll(args, Accumulator.fromOpts(command.options, env), Nil), mode)
 
   private[this] val help = Help.fromCommand(command)
 
-  private[this] def failure[A](reason: String*): Either[Help, A] =
-    Left(help.withErrors(reason.toList))
+  private[this] def evalResult[A](out: Result[A], mode: ParseMode): Ior[Help, A] = {
+    // Partition issues into errors and warnings (reverse to get chronological order)
+    val reversedIssues = out.issues.reverse
+    val parseErrors = reversedIssues.collect { case Error(msg) => msg }
+    val warnings = reversedIssues.collect { case Warning(msg) => msg }
+    val hasParseErrors = parseErrors.nonEmpty
 
-  private[this] def evalResult[A](out: Result[A]): Either[Help, A] = out.get match {
-    case Invalid(failed) => failure(failed.messages.distinct: _*)
-    // NB: if any of the user-provided functions have side-effects, they will happen here!
-    case Valid(fn) =>
-      fn() match {
-        case Invalid(messages) => failure(messages.distinct: _*)
-        case Valid(result) => Right(result)
-      }
+    out.get match {
+      case Invalid(failed) =>
+        // Structural failure - all messages become errors
+        val allErrors = failed.messages.distinct.toList ++ parseErrors.distinct ++ warnings.distinct
+        Ior.left(help.withErrors(allErrors))
+
+      case Valid(_) if hasParseErrors =>
+        // Had parse errors - cannot produce A, all messages become errors
+        val allErrors = parseErrors.distinct ++ warnings.distinct
+        Ior.left(help.withErrors(allErrors))
+
+      case Valid(fn) =>
+        fn() match {
+          case Invalid(validationMessages) =>
+            // Validation failed - all messages become errors
+            val allErrors = validationMessages.distinct ++ warnings.distinct
+            Ior.left(help.withErrors(allErrors))
+
+          case Valid(result) =>
+            val distinctWarnings = warnings.distinct
+            if (distinctWarnings.isEmpty) {
+              Ior.right(result)
+            } else {
+              mode match {
+                case ParseMode.Strict =>
+                  // In strict mode, warnings are promoted to errors
+                  Ior.left(help.withErrors(distinctWarnings))
+                case ParseMode.Lenient =>
+                  // In lenient mode, return both warnings and result
+                  Ior.both(help.withWarnings(distinctWarnings), result)
+              }
+            }
+        }
+    }
   }
 
   def toOption[B](args: ArgOut[B]): Option[Accumulator[B]] =
     args.collect { case Right(a) => a }.reduceOption(Accumulator.OrElse(_, _))
 
   @tailrec
-  private[this] def consumeAll(args: List[String], accumulator: Accumulator[A]): Either[Help, A] =
+  private[this] def consumeAll(
+      args: List[String],
+      accumulator: Accumulator[A],
+      issues: List[ParseIssue]
+  ): Result[A] =
     args match {
-      case LongOptWithEquals(option, value) :: rest => {
+      case LongOptWithEquals(option, value) :: rest =>
         accumulator.parseOption(Opts.LongName(option)) match {
-          case Some(MatchFlag(next)) => failure(s"Got unexpected value for flag: --$option")
-          case Some(MatchAmbiguous) => failure(s"Ambiguous option/flag: --$option")
-          case Some(MatchOption(next)) => consumeAll(rest, next(value))
-          case Some(MatchOptArg(next)) => consumeAll(rest, next(Some(value)))
-          case None => Left(help.withErrors(s"Unexpected option: --$option" :: Nil))
+          case Some(MatchFlag(_)) =>
+            consumeAll(rest, accumulator, Error(s"Got unexpected value for flag: --$option") :: issues)
+          case Some(MatchAmbiguous) =>
+            consumeAll(rest, accumulator, Error(s"Ambiguous option/flag: --$option") :: issues)
+          case Some(MatchOption(next)) => consumeAll(rest, next(value), issues)
+          case Some(MatchOptArg(next)) => consumeAll(rest, next(Some(value)), issues)
+          case None =>
+            consumeAll(rest, accumulator, Warning(s"Unexpected option: --$option") :: issues)
         }
-      }
       case LongOpt(option) :: rest =>
         accumulator.parseOption(Opts.LongName(option)) match {
-          case Some(MatchFlag(next)) => consumeAll(rest, next)
-          case Some(MatchAmbiguous) => failure(s"Ambiguous option/flag: --$option")
-          case Some(MatchOptArg(next)) => consumeAll(rest, next(None))
+          case Some(MatchFlag(next)) => consumeAll(rest, next, issues)
+          case Some(MatchAmbiguous) =>
+            consumeAll(rest, accumulator, Error(s"Ambiguous option/flag: --$option") :: issues)
+          case Some(MatchOptArg(next)) => consumeAll(rest, next(None), issues)
           case Some(MatchOption(next)) =>
             rest match {
-              case Nil => failure(s"Missing value for option: --$option")
-              case value :: rest0 => consumeAll(rest0, next(value))
+              case Nil =>
+                accumulator.result.withIssues(Error(s"Missing value for option: --$option") :: issues)
+              case value :: rest0 => consumeAll(rest0, next(value), issues)
             }
-          case None => Left(help.withErrors(s"Unexpected option: --$option" :: Nil))
+          case None =>
+            consumeAll(rest, accumulator, Warning(s"Unexpected option: --$option") :: issues)
         }
-      case "--" :: rest => consumeArgs(rest, accumulator)
-      case ShortOpt(NonEmptyString(flag, tail)) :: rest => {
+      case "--" :: rest => consumeArgs(rest, accumulator, issues)
+      case ShortOpt(NonEmptyString(flag, tail)) :: rest =>
 
         @tailrec
         def consumeShort(
             char: Char,
             tail: String,
-            accumulator: Accumulator[A]
-        ): Either[Help, (List[String], Accumulator[A])] =
+            accumulator: Accumulator[A],
+            issues: List[ParseIssue]
+        ): Either[Result[A], (List[String], Accumulator[A], List[ParseIssue])] =
           accumulator.parseOption(Opts.ShortName(char)) match {
-            case Some(MatchAmbiguous) => failure(s"Ambiguous option/flag: -$char")
+            case Some(MatchAmbiguous) =>
+              tail match {
+                case "" => Right((rest, accumulator, Error(s"Ambiguous option/flag: -$char") :: issues))
+                case NonEmptyString(nextFlag, nextTail) =>
+                  consumeShort(nextFlag, nextTail, accumulator, Error(s"Ambiguous option/flag: -$char") :: issues)
+              }
             case Some(MatchFlag(next)) =>
               tail match {
-                case "" => Right(rest -> next)
-                case NonEmptyString(nextFlag, nextTail) => consumeShort(nextFlag, nextTail, next)
+                case "" => Right((rest, next, issues))
+                case NonEmptyString(nextFlag, nextTail) => consumeShort(nextFlag, nextTail, next, issues)
               }
 
             case Some(MatchOptArg(next)) =>
               tail match {
-                case "" => Right((rest, next(None)))
-                case value => Right((rest, next(Some(value))))
+                case "" => Right((rest, next(None), issues))
+                case value => Right((rest, next(Some(value)), issues))
               }
 
             case Some(MatchOption(next)) =>
               tail match {
                 case "" =>
                   rest match {
-                    case Nil => failure(s"Missing value for option: -$char")
-                    case value :: rest0 => Right(rest0 -> next(value))
+                    case Nil =>
+                      Left(accumulator.result.withIssues(Error(s"Missing value for option: -$char") :: issues))
+                    case value :: rest0 => Right((rest0, next(value), issues))
                   }
-                case _ => Right(rest -> next(tail))
+                case _ => Right((rest, next(tail), issues))
               }
-            case None => Left(help.withErrors(s"Unexpected option: -$char" :: Nil))
+            case None =>
+              tail match {
+                case "" => Right((rest, accumulator, Warning(s"Unexpected option: -$char") :: issues))
+                case NonEmptyString(nextFlag, nextTail) =>
+                  consumeShort(nextFlag, nextTail, accumulator, Warning(s"Unexpected option: -$char") :: issues)
+              }
           }
 
-        consumeShort(flag, tail, accumulator) match {
-          case Right((newRest, newAccumulator)) => consumeAll(newRest, newAccumulator)
-          case Left(help) => Left(help)
+        consumeShort(flag, tail, accumulator, issues) match {
+          case Right((newRest, newAccumulator, newIssues)) =>
+            consumeAll(newRest, newAccumulator, newIssues)
+          case Left(result) => result
         }
-      }
       case arg :: rest =>
         accumulator
           .parseSub(arg)
-          .map { result =>
-            result(rest).leftMap { _.withPrefix(List(command.name)) }.flatMap(evalResult)
+          .map { parseSubcommand =>
+            parseSubcommand(rest).leftMap { _.withPrefix(List(command.name)) } match {
+              case Left(h) =>
+                // Convert Help errors to ParseIssue.Error
+                val helpErrors = h.errors.map(Error(_))
+                Result.fail.withIssues(helpErrors.reverse ++ issues)
+              case Right(r) => r.withIssues(issues)
+            }
           } match {
           case Some(out) => out
           case None =>
             toOption(accumulator.parseArg(arg)) match {
-              case Some(next) => consumeAll(rest, next)
-              case None => failure(s"Unexpected argument: $arg")
+              case Some(next) => consumeAll(rest, next, issues)
+              case None =>
+                consumeAll(rest, accumulator, Warning(s"Unexpected argument: $arg") :: issues)
             }
         }
-      case Nil => evalResult(accumulator.result)
+      case Nil => accumulator.result.withIssues(issues)
     }
 
   @tailrec
-  private[this] def consumeArgs(args: List[String], accumulator: Accumulator[A]): Either[Help, A] =
+  private[this] def consumeArgs(
+      args: List[String],
+      accumulator: Accumulator[A],
+      issues: List[ParseIssue]
+  ): Result[A] =
     args match {
-      case Nil => evalResult(accumulator.result)
-      case arg :: rest => {
+      case Nil => accumulator.result.withIssues(issues)
+      case arg :: rest =>
         toOption(accumulator.parseArg(arg)) match {
-          case Some(next) => consumeArgs(rest, next)
-          case None => failure(s"Unexpected argument: $arg")
+          case Some(next) => consumeArgs(rest, next, issues)
+          case None =>
+            consumeArgs(rest, accumulator, Warning(s"Unexpected argument: $arg") :: issues)
         }
-      }
     }
 }
 
@@ -150,11 +229,28 @@ private[decline] object Parser {
 
   type ArgOut[+A] = NonEmptyList[Either[Accumulator[A], Accumulator[A]]]
 
-  def squish[A](argOut: ArgOut[A]): ArgOut[A] = argOut match {
-    case NonEmptyList(Left(x), Left(y) :: rest) => squish(NonEmptyList(Left(OrElse(x, y)), rest))
-    case NonEmptyList(Right(x), Right(y) :: rest) => squish(NonEmptyList(Right(OrElse(x, y)), rest))
-    case NonEmptyList(x, y :: rest) => NonEmptyList(x, squish(NonEmptyList(y, rest)).toList)
-    case _ => argOut
+  /** Merges consecutive Left or Right elements using OrElse.
+    * Rewritten to be stack-safe using an iterative approach.
+    */
+  def squish[A](argOut: ArgOut[A]): ArgOut[A] = {
+    @tailrec
+    def merge(
+        current: Either[Accumulator[A], Accumulator[A]],
+        rest: List[Either[Accumulator[A], Accumulator[A]]],
+        acc: List[Either[Accumulator[A], Accumulator[A]]]
+    ): List[Either[Accumulator[A], Accumulator[A]]] =
+      rest match {
+        case Nil => (current :: acc).reverse
+        case next :: tail =>
+          (current, next) match {
+            case (Left(x), Left(y)) => merge(Left(OrElse(x, y)), tail, acc)
+            case (Right(x), Right(y)) => merge(Right(OrElse(x, y)), tail, acc)
+            case _ => merge(next, tail, current :: acc)
+          }
+      }
+
+    val merged = merge(argOut.head, argOut.tail, Nil)
+    NonEmptyList.fromListUnsafe(merged)
   }
 
   type Err[+A] = Validated[List[String], A]
@@ -191,7 +287,7 @@ private[decline] object Parser {
 
       override def result = value
 
-      override def mapValidated[B](fn: (A) => Err[B]): Accumulator[B] = Pure(value.mapValidated(fn))
+      override def mapValidated[B](fn: A => Err[B]): Accumulator[B] = Pure(value.mapValidated(fn))
     }
 
     def ap[A, B](left: Accumulator[A => B], right: Accumulator[A]): Accumulator[B] =
@@ -285,7 +381,7 @@ private[decline] object Parser {
 
       override def result = left.result <+> right.result
 
-      override def mapValidated[B](fn: (A) => Err[B]): Accumulator[B] =
+      override def mapValidated[B](fn: A => Err[B]): Accumulator[B] =
         OrElse(left.mapValidated(fn), right.mapValidated(fn))
     }
 
